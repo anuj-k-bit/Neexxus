@@ -1,4 +1,5 @@
 import os
+import sys
 import streamlit as st
 import requests
 import time
@@ -6,9 +7,20 @@ import uuid
 import logfire
 from dotenv import load_dotenv
 
-# Load environment variables
+# Ensure root directory is on Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# Load environment variables from .env
 env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv(dotenv_path=env_path)
+
+# Synchronize Streamlit Cloud Secrets into environment variables
+try:
+    for k, v in st.secrets.items():
+        if isinstance(v, str) and k not in os.environ:
+            os.environ[k] = v
+except Exception:
+    pass
 
 # Initialize Logfire
 try:
@@ -112,7 +124,10 @@ if "session_id" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+try:
+    backend_url = st.secrets.get("BACKEND_URL", os.getenv("BACKEND_URL", "http://127.0.0.1:8080"))
+except Exception:
+    backend_url = os.getenv("BACKEND_URL", "http://127.0.0.1:8080")
 
 # --- BACKEND HEALTH PROBE ---
 def check_backend_health():
@@ -126,6 +141,125 @@ def check_backend_health():
 
 is_backend_online, health_data = check_backend_health()
 
+def execute_upload(file_name: str, file_bytes: bytes, file_type: str = None):
+    """Handles document upload via HTTP backend if online, or in-process standalone on Streamlit Cloud."""
+    if is_backend_online:
+        try:
+            files = {"file": (file_name, file_bytes, file_type or "application/octet-stream")}
+            res = requests.post(f"{backend_url}/upload", files=files, timeout=120)
+            if res.status_code == 200:
+                return res.json()
+        except Exception:
+            pass
+
+    # In-process standalone execution (Streamlit Cloud)
+    import uuid
+    from qdrant_client.http import models
+    from app.config import settings
+    from app.services.retrieval.qdrant_service import get_qdrant_client
+    from app.ingestion.chunking.splitter import chunk_text
+    from app.services.retrieval.embedding import embed_texts
+
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    upload_dir = os.path.abspath("DATA/uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    temp_path = os.path.join(upload_dir, f"{uuid.uuid4().hex[:8]}_{file_name}")
+    with open(temp_path, "wb") as f:
+        f.write(file_bytes)
+
+    if ext == "pdf":
+        from app.ingestion.loaders.pdf import parse_pdf
+        full_text = parse_pdf(temp_path)
+    elif ext in ("docx", "pptx"):
+        from app.ingestion.loaders.office import parse_office
+        full_text = parse_office(temp_path)
+    elif ext in ("html", "htm"):
+        from app.ingestion.loaders.html import parse_html
+        full_text = parse_html(temp_path)
+    elif ext == "txt":
+        from app.ingestion.loaders.text import parse_text
+        full_text = parse_text(temp_path)
+    else:
+        raise Exception(f"Unsupported file type .{ext}")
+
+    if not full_text or not full_text.strip():
+        raise Exception(f"No readable text could be extracted from {file_name}.")
+
+    chunks = chunk_text(full_text)
+    if not chunks:
+        raise Exception("Document could not be chunked.")
+
+    embeddings = embed_texts(chunks)
+    points = [
+        models.PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vector,
+            payload={"text": chunk, "source": file_name, "source_type": "user_upload"}
+        )
+        for chunk, vector in zip(chunks, embeddings)
+    ]
+    client = get_qdrant_client()
+    if not client.collection_exists(settings.QDRANT_COLLECTION):
+        from app.services.retrieval.embedding import get_embedding_dim
+        dim = get_embedding_dim()
+        client.create_collection(
+            collection_name=settings.QDRANT_COLLECTION,
+            vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE)
+        )
+    client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points)
+    return {
+        "status": "success",
+        "filename": file_name,
+        "chunks_indexed": len(points),
+        "message": f"Successfully indexed {len(points)} chunks from '{file_name}' into NEXUS-RAG."
+    }
+
+def execute_query(prompt_text: str, session_id: str):
+    """Executes query via HTTP backend if online, or in-process standalone on Streamlit Cloud."""
+    if is_backend_online:
+        try:
+            url = f"{backend_url}/query"
+            payload = {"q": prompt_text, "thread_id": session_id}
+            response = requests.post(url, json=payload, timeout=90)
+            if response.status_code == 200:
+                return response.json()
+        except Exception:
+            pass
+
+    # In-process standalone execution (Streamlit Cloud)
+    from app.guardrails import guard, initialize_rails
+    initialize_rails()
+    rail_fired, rail_response = guard(prompt_text)
+    if rail_fired:
+        return {
+            "question": prompt_text,
+            "answer": rail_response,
+            "thought_process": [
+                "Safety guardrails evaluated",
+                "Policy triggered: Intercepted before retrieval"
+            ],
+            "status": "Guardrail policy triggered",
+            "sources": []
+        }
+
+    from app.agents.graph import rag_agent
+    initial_state = {
+        "messages": [{"role": "user", "content": prompt_text}],
+        "current_query": prompt_text,
+        "documents": [],
+        "plan": ["Start"],
+        "status": "Initializing NEXUS-RAG Graph..."
+    }
+    config = {"configurable": {"thread_id": session_id}}
+    final_output = rag_agent.invoke(initial_state, config=config)
+    return {
+        "question": prompt_text,
+        "answer": final_output.get("final_answer", "No answer generated."),
+        "thought_process": final_output.get("plan", ["Response generated"]),
+        "status": final_output.get("status", "Complete"),
+        "sources": final_output.get("documents", [])
+    }
+
 # --- SIDEBAR ---
 with st.sidebar:
     st.markdown("### ⚡ NEXUS-RAG")
@@ -133,18 +267,16 @@ with st.sidebar:
     st.markdown("---")
     
     # System Status Card
+    points_count = 0
     if is_backend_online:
         st.success("🟢 **Backend API**: Online & Connected")
-        points_count = 0
         try:
             r = requests.get(f"{backend_url}/collection/stats", timeout=2)
             if r.status_code == 200:
                 points_count = r.json().get("points_count", 0)
         except Exception:
             pass
-
         st.metric(label="📚 Knowledge Base Size", value=f"{points_count} chunks")
-
         with st.expander("System Specs", expanded=False):
             st.write(f"**Reasoning**: `{health_data.get('reasoning_model', 'Groq / GPT-OSS-120B')}`")
             st.write(f"**Embedding**: `{health_data.get('embedding_model', 'Gemini 3072-dim')}`")
@@ -152,9 +284,21 @@ with st.sidebar:
             st.write(f"**Reranker**: `FlashRank (Local ONNX)`")
             st.write(f"**Safety**: `NeMo Guardrails Active`")
     else:
-        st.error("🔴 **Backend API**: Disconnected")
-        st.caption(f"Target: `{backend_url}`")
-        st.info("Start API: `uvicorn app.main:app --port 8080`")
+        st.success("☁️ **Engine**: Standalone Cloud Engine")
+        try:
+            from app.services.retrieval.qdrant_service import get_qdrant_client
+            from app.config import settings
+            client = get_qdrant_client()
+            if client.collection_exists(settings.QDRANT_COLLECTION):
+                points_count = client.get_collection(settings.QDRANT_COLLECTION).points_count
+        except Exception:
+            pass
+        st.metric(label="📚 Knowledge Base Size", value=f"{points_count} chunks")
+        with st.expander("System Specs", expanded=False):
+            st.write("**Reasoning**: `Groq / GPT-OSS-120B`")
+            st.write("**Embedding**: `Gemini 3072-dim`")
+            st.write("**Reranker**: `FlashRank (ONNX)`")
+            st.write("**Mode**: `In-Process Cloud Execution`")
     
     st.markdown("---")
     st.markdown("### 📤 Ingest Documents")
@@ -171,14 +315,9 @@ with st.sidebar:
             for up_file in uploaded_files:
                 with st.spinner(f"Vectorizing '{up_file.name}' with Gemini..."):
                     try:
-                        files = {"file": (up_file.name, up_file.getvalue(), up_file.type or "application/octet-stream")}
-                        res = requests.post(f"{backend_url}/upload", files=files, timeout=120)
-                        if res.status_code == 200:
-                            data = res.json()
-                            st.success(f"✅ {data.get('message', 'Indexed successfully!')}")
-                            success_count += 1
-                        else:
-                            st.error(f"❌ Failed to index '{up_file.name}': {res.text}")
+                        data = execute_upload(up_file.name, up_file.getvalue(), up_file.type)
+                        st.success(f"✅ {data.get('message', 'Indexed successfully!')}")
+                        success_count += 1
                     except Exception as err:
                         st.error(f"❌ Upload error: {err}")
             if success_count > 0:
@@ -240,79 +379,142 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Display chat history
-for message in st.session_state.messages:
-    avatar = AI_AVATAR if message["role"] == "assistant" else USER_AVATAR
-    with st.chat_message(message["role"], avatar=avatar):
-        st.markdown(message["content"])
+tab_chat, tab_arch = st.tabs(["💬 Enterprise Assistant", "🏗️ System Architecture & Workflow"])
 
-# Preset query handler
-preset = st.session_state.pop("preset_query", None)
-prompt_input = st.chat_input("Ask a technical question about your enterprise documentation...")
-active_prompt = preset or prompt_input
+with tab_chat:
+    # Display chat history
+    for message in st.session_state.messages:
+        avatar = AI_AVATAR if message["role"] == "assistant" else USER_AVATAR
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
 
-if active_prompt:
-    # Append user message
-    st.session_state.messages.append({"role": "user", "content": active_prompt})
-    with st.chat_message("user", avatar=USER_AVATAR):
-        st.markdown(active_prompt)
+    # Preset query handler
+    preset = st.session_state.pop("preset_query", None)
+    prompt_input = st.chat_input("Ask a technical question about your enterprise documentation...")
+    active_prompt = preset or prompt_input
 
-    # Process assistant response
-    with st.chat_message("assistant", avatar=AI_AVATAR):
-        data = {}
-        with st.status("⚡ NEXUS-RAG Execution Cycle...", expanded=True) as status_box:
-            try:
-                with logfire.span("📡 NEXUS-RAG Query", query=active_prompt, session_id=st.session_state.session_id):
-                    url = f"{backend_url}/query"
-                    payload = {"q": active_prompt, "thread_id": st.session_state.session_id}
-                    response = requests.post(url, json=payload, timeout=90)
-                    
-                    if response.status_code != 200:
-                        status_box.update(label="❌ API Error", state="error")
-                        st.error(f"Backend returned status {response.status_code}: {response.text}")
-                        st.stop()
-                        
-                    data = response.json()
+    if active_prompt:
+        # Append user message
+        st.session_state.messages.append({"role": "user", "content": active_prompt})
+        with st.chat_message("user", avatar=USER_AVATAR):
+            st.markdown(active_prompt)
 
-                # Safe execution status display (no internal chain-of-thought exposed)
-                steps = data.get("thought_process", [])
-                for step in steps:
-                    st.write(f"⚙️ {step}")
+        # Process assistant response
+        with st.chat_message("assistant", avatar=AI_AVATAR):
+            data = {}
+            with st.status("⚡ NEXUS-RAG Execution Cycle...", expanded=True) as status_box:
+                try:
+                    with logfire.span("📡 NEXUS-RAG Query", query=active_prompt, session_id=st.session_state.session_id):
+                        data = execute_query(active_prompt, st.session_state.session_id)
 
-                status_box.update(label="✅ Response Synthesized", state="complete", expanded=False)
+                    # Safe execution status display (no internal chain-of-thought exposed)
+                    steps = data.get("thought_process", [])
+                    for step in steps:
+                        st.write(f"⚙️ {step}")
 
-            except requests.exceptions.ConnectionError:
-                logfire.error("❌ UI cannot reach backend")
-                status_box.update(label="❌ Connection Failed", state="error")
-                st.error(f"Cannot connect to NEXUS-RAG backend at `{backend_url}`. Ensure `uvicorn app.main:app` is running.")
-                st.stop()
-            except Exception as e:
-                logfire.error(f"❌ Execution Error: {e}")
-                status_box.update(label="❌ Execution Error", state="error")
-                st.error(f"Internal error processing query: {e}")
-                st.stop()
+                    status_box.update(label="✅ Response Synthesized", state="complete", expanded=False)
 
-        # Stream the synthesized answer
-        answer_placeholder = st.empty()
-        full_answer = data.get("answer", "No response generated.")
+                except Exception as e:
+                    logfire.error(f"❌ Execution Error: {e}")
+                    status_box.update(label="❌ Execution Error", state="error")
+                    st.error(f"Internal error processing query: {e}")
+                    st.stop()
+
+            # Stream the synthesized answer
+            answer_placeholder = st.empty()
+            full_answer = data.get("answer", "No response generated.")
+            
+            curr_text = ""
+            for char in full_answer:
+                curr_text += char
+                answer_placeholder.markdown(curr_text + "▌")
+                time.sleep(0.003)
+            answer_placeholder.markdown(full_answer)
+
+            # Source Attribution / Document Inspector
+            sources = data.get("sources", [])
+            if sources:
+                with st.expander(f"📄 Retrieved Context & Grounding Sources ({len(sources)} Chunks)", expanded=False):
+                    for idx, src in enumerate(sources):
+                        st.markdown(f"**Chunk {idx + 1}**")
+                        st.info(src)
+            else:
+                st.caption("ℹ️ Response generated from conversational memory or direct synthesis.")
+
+            st.session_state.messages.append({"role": "assistant", "content": full_answer})
+            logfire.info("✅ NEXUS-RAG chat turn completed.")
+
+with tab_arch:
+    st.markdown("### 🏗️ NEXUS-RAG System Architecture & Data Flow")
+    st.caption("Architected by **Anuj Kekre** · Agentic Document Intelligence Platform v1.0.0")
+
+    st.markdown("""
+    ```mermaid
+    graph TD
+        User([👤 User / Client]) --> UI[🖥️ Streamlit Interface Layer]
+        UI -->|HTTP /query| API[⚡ FastAPI Service Gate]
         
-        curr_text = ""
-        for char in full_answer:
-            curr_text += char
-            answer_placeholder.markdown(curr_text + "▌")
-            time.sleep(0.003)
-        answer_placeholder.markdown(full_answer)
+        subgraph SafetyGate ["🛡️ Gate 1: Safety & Guardrails"]
+            API --> GR{"NeMo Guardrails\\nSafety Check"}
+            GR -- "Jailbreak / Toxic / Off-Topic" --> Block["🚫 Block / Intercept"]
+            GR -- "Safe Query" --> Core["🧠 LangGraph Agent Core"]
+        end
+        
+        subgraph AgentCore ["🧠 Gate 2: Agentic Planning"]
+            Core --> Planner["🧭 Query Planner Node\\nIntent & Search Reformulation"]
+            Planner -- "Conversational / Greeting" --> Responder["✍️ Responder Node"]
+            Planner -- "Technical Question" --> Retriever["🔍 Retriever Node"]
+        end
+        
+        subgraph RetrievalLayer ["🔎 Gate 3 & 4: Two-Stage Retrieval"]
+            Retriever --> Embed["📐 Google Gemini Embedding\\n(3072-dim Cosine)"]
+            Embed --> Qdrant[("🗄️ Qdrant Vector Store\\nLocal / Cloud")]
+            Qdrant --> Candidates["Top 15 Vector Chunks"]
+            Candidates --> FlashRank["⚖️ FlashRank Cross-Encoder\\n(ms-marco-TinyBERT ONNX)"]
+            FlashRank --> Top5["Top 5 High-Precision Matches"]
+        end
+        
+        subgraph SynthesisLayer ["✍️ Gate 5: Grounded Synthesis"]
+            Top5 --> Responder
+            Responder --> GroqLLM["⚡ Groq Inference Engine\\n(openai/gpt-oss-120b)"]
+            GroqLLM --> Output["📑 Grounded Answer + Source Citations"]
+        end
+        
+        Output --> UI
+        Block --> UI
+    ```
+    """)
 
-        # Source Attribution / Document Inspector
-        sources = data.get("sources", [])
-        if sources:
-            with st.expander(f"📄 Retrieved Context & Grounding Sources ({len(sources)} Chunks)", expanded=False):
-                for idx, src in enumerate(sources):
-                    st.markdown(f"**Chunk {idx + 1}**")
-                    st.info(src)
-        else:
-            st.caption("ℹ️ Response generated from conversational memory or direct synthesis.")
+    st.markdown("---")
+    st.markdown("#### ⚙️ Technical Component Matrix")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        | Component | Technology | Rationale |
+        | :--- | :--- | :--- |
+        | **User Interface** | Streamlit | Real-time telemetry, thought trace & document inspector |
+        | **Backend API** | FastAPI / Uvicorn | Async performance, strict Pydantic schemas, Swagger docs |
+        | **Agent Framework** | LangGraph | Stateful cyclic graph with intent routing & conversation memory |
+        | **Safety Engine** | NeMo Guardrails | Deterministic Colang safety policies & jailbreak interception |
+        """)
+    with col2:
+        st.markdown("""
+        | Component | Technology | Rationale |
+        | :--- | :--- | :--- |
+        | **Embedding Model** | Gemini 2.0 Preview | 3072-dimensional high-resolution semantic dense vectors |
+        | **Vector Database** | Qdrant (Local / Cloud) | Scalable ANN vector search with metadata payload filtering |
+        | **Reranker** | FlashRank ONNX | Sub-20ms cross-encoder reranking on CPU (zero GPU needed) |
+        | **LLM Engine** | Groq LPU | Sub-second token generation with `openai/gpt-oss-120b` |
+        """)
 
-        st.session_state.messages.append({"role": "assistant", "content": full_answer})
-        logfire.info("✅ NEXUS-RAG chat turn completed.")
+    st.markdown("---")
+    st.markdown("#### 🔄 The 5 Execution Gates")
+    st.markdown("""
+    1. **Gate 1 — NeMo Guardrails:** Validates user inputs against safety boundaries. Jailbreak attempts or off-topic abuse are stopped before hitting search or the LLM.
+    2. **Gate 2 — LangGraph Planner:** Examines conversational history and reformulates technical questions into optimized dense vector search targets.
+    3. **Gate 3 — Qdrant Vector Search:** Retrieves 15 semantically similar document chunks using cosine similarity across 3072 dimensions.
+    4. **Gate 4 — FlashRank Reranker:** Evaluates token-level query-document cross-attention to filter out false positives and pick the top 5 chunks.
+    5. **Gate 5 — Grounded Synthesis:** Feeds only verified context into Groq's high-speed inference engine, strictly enforcing source citations.
+    """)
 
